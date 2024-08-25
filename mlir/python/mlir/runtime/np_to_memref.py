@@ -5,6 +5,7 @@
 #  This file contains functions to convert between Memrefs and NumPy arrays and vice-versa.
 
 import numpy as np
+import torch
 import ctypes
 
 try:
@@ -32,6 +33,12 @@ class F16(ctypes.Structure):
     _fields_ = [("f16", ctypes.c_int16)]
 
 
+class F32(ctypes.Structure):
+    """A ctype representation for MLIR's Float32."""
+
+    _fields_ = [("f32", ctypes.c_float)]
+
+
 class BF16(ctypes.Structure):
     """A ctype representation for MLIR's BFloat16."""
 
@@ -47,6 +54,14 @@ def as_ctype(dtp):
         return C64
     if dtp == np.dtype(np.float16):
         return F16
+    if dtp == torch.complex128:
+        return C128
+    if dtp == torch.complex64:
+        return C64
+    if dtp == torch.float16:
+        return F16
+    if dtp == torch.float32:
+        return F32
     if ml_dtypes is not None and dtp == ml_dtypes.bfloat16:
         return BF16
     return np.ctypeslib.as_ctypes_type(dtp)
@@ -103,26 +118,49 @@ class UnrankedMemRefDescriptor(ctypes.Structure):
 
 
 def get_ranked_memref_descriptor(nparray):
-    """Returns a ranked memref descriptor for the given numpy array."""
-    ctp = as_ctype(nparray.dtype)
-    if nparray.ndim == 0:
-        x = make_zero_d_memref_descriptor(ctp)()
+    """Returns a ranked memref descriptor for the given numpy array or torch tensor."""
+    if isinstance(nparray, np.ndarray):
+        ctp = as_ctype(nparray.dtype)
+        if nparray.ndim == 0:
+            x = make_zero_d_memref_descriptor(ctp)()
+            x.allocated = nparray.ctypes.data
+            x.aligned = nparray.ctypes.data_as(ctypes.POINTER(ctp))
+            x.offset = ctypes.c_longlong(0)
+            return x
+
+        x = make_nd_memref_descriptor(nparray.ndim, ctp)()
         x.allocated = nparray.ctypes.data
         x.aligned = nparray.ctypes.data_as(ctypes.POINTER(ctp))
         x.offset = ctypes.c_longlong(0)
+        x.shape = nparray.ctypes.shape
+
+        # Numpy uses byte quantities to express strides, MLIR OTOH uses the
+        # torch abstraction which specifies strides in terms of elements.
+        strides_ctype_t = ctypes.c_longlong * nparray.ndim
+        x.strides = strides_ctype_t(*[x // nparray.itemsize for x in nparray.strides])
         return x
+    elif isinstance(nparray, torch.Tensor):
+        tensor = nparray
+        ctp = as_ctype(tensor.dtype)
+        if tensor.ndim == 0:
+            x = make_zero_d_memref_descriptor(ctp)()
+            x.allocated = tensor.data_ptr()
+            x.aligned = ctypes.cast(tensor.data_ptr(), ctypes.POINTER(ctp))
+            x.offset = ctypes.c_longlong(0)
+            return x
 
-    x = make_nd_memref_descriptor(nparray.ndim, ctp)()
-    x.allocated = nparray.ctypes.data
-    x.aligned = nparray.ctypes.data_as(ctypes.POINTER(ctp))
-    x.offset = ctypes.c_longlong(0)
-    x.shape = nparray.ctypes.shape
+        x = make_nd_memref_descriptor(tensor.ndim, ctp)()
+        x.allocated = tensor.data_ptr()
+        x.aligned = ctypes.cast(tensor.data_ptr(), ctypes.POINTER(ctp))
+        x.offset = ctypes.c_longlong(0)
 
-    # Numpy uses byte quantities to express strides, MLIR OTOH uses the
-    # torch abstraction which specifies strides in terms of elements.
-    strides_ctype_t = ctypes.c_longlong * nparray.ndim
-    x.strides = strides_ctype_t(*[x // nparray.itemsize for x in nparray.strides])
-    return x
+        shape_ctype_t = ctypes.c_longlong * tensor.ndim
+        x.shape = shape_ctype_t(*tensor.shape)
+
+        # PyTorch uses element quantities to express strides
+        strides_ctype_t = ctypes.c_longlong * tensor.ndim
+        x.strides = strides_ctype_t(*tensor.stride())
+        return x
 
 
 def get_unranked_memref_descriptor(nparray):

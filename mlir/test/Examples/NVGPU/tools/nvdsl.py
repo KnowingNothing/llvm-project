@@ -7,6 +7,7 @@ from mlir.dialects import arith, func, gpu, memref, nvgpu, scf, nvvm
 from mlir.extras import types as T
 from mlir import runtime as rt
 from tools import nvgpucompiler
+import torch
 
 MLIR_DYNAMIC = -9223372036854775808
 
@@ -46,6 +47,10 @@ def get_mlir_func_obj_ty(inputArgs):
         elif isinstance(arg, float):
             args.append(c_float_p(arg))
         elif isinstance(arg, np.ndarray):
+            args.append(
+                ctypes.pointer(ctypes.pointer(rt.get_ranked_memref_descriptor(arg)))
+            )
+        elif isinstance(arg, torch.Tensor):
             args.append(
                 ctypes.pointer(ctypes.pointer(rt.get_ranked_memref_descriptor(arg)))
             )
@@ -289,6 +294,19 @@ def get_mlir_ty(arg):
             return T.i64()
         raise NotImplementedError(dtype)
 
+    def get_mlir_ty_from_torch(dtype):
+        if dtype == torch.float16:
+            return T.f16()
+        if dtype == torch.float32:
+            return T.f32()
+        if dtype == torch.float64:
+            return T.f64()
+        if dtype == torch.int32:
+            return T.i32()
+        if dtype == torch.int64:
+            return T.i64()
+        raise NotImplementedError(dtype)
+
     if isinstance(arg, bool):
         return T.bool()
     elif isinstance(arg, int):
@@ -300,7 +318,69 @@ def get_mlir_ty(arg):
         dtype = get_mlir_ty_from_np(arg.dtype)
         shape = descriptor.shape
         return memref.MemRefType.get(shape, dtype)
+    elif isinstance(arg, torch.Tensor):
+        descriptor = rt.get_ranked_memref_descriptor(arg)
+        dtype = get_mlir_ty_from_torch(arg.dtype)
+        shape = descriptor.shape
+        return memref.MemRefType.get(shape, dtype)
     raise NotImplementedError(arg)
+
+
+def _binary_op(lhs, rhs, op: str, predAtt="") -> "ArithValue":
+    """Generate MLIR's Arith dialects binary operations."""
+    rhs = const(rhs)
+    if arith._is_float_type(lhs.type) and arith._is_float_type(rhs.type):
+        op += "F"
+        if op.startswith("Cmp"):
+            predicateAttr = getattr(arith, f"CmpFPredicate").__dict__[predAtt]
+    elif arith._is_integer_like_type(lhs.type) and arith._is_integer_like_type(
+        lhs.type
+    ):
+        if op == "Div" or op == "Rem":
+            op += "U"
+        op += "I"
+        if op.startswith("Cmp"):
+            predicateAttr = getattr(arith, f"CmpIPredicate").__dict__[predAtt]
+    else:
+        raise NotImplementedError(f"Unsupported '{op}' operands: {lhs}, {rhs}")
+
+    if op.startswith("Cmp"):
+        op = getattr(arith, f"{op}Op")
+
+        return op(predicateAttr, lhs, rhs).result
+    else:
+        op = getattr(arith, f"{op}Op")
+        return op(lhs, rhs).result
+
+
+@ir.register_value_caster(ir.IndexType.static_typeid)
+@ir.register_value_caster(ir.F32Type.static_typeid)
+@ir.register_value_caster(ir.F16Type.static_typeid)
+@ir.register_value_caster(ir.F64Type.static_typeid)
+@ir.register_value_caster(ir.IntegerType.static_typeid)
+class ArithValue(ir.Value):
+    """Overloads operators for MLIR's Arith dialects binary operations."""
+
+    def __init__(self, v):
+        super().__init__(v)
+
+    __add__ = partialmethod(_binary_op, op="Add")
+    __sub__ = partialmethod(_binary_op, op="Sub")
+    __mul__ = partialmethod(_binary_op, op="Mul")
+    __truediv__ = partialmethod(_binary_op, op="Div")
+    __mod__ = partialmethod(_binary_op, op="Rem")
+    __xor__ = partialmethod(_binary_op, op="XOr")
+    __lt__ = partialmethod(_binary_op, op="Cmp", predAtt="ult")
+    __le__ = partialmethod(_binary_op, op="Cmp", predAtt="ule")
+    __eq__ = partialmethod(_binary_op, op="Cmp", predAtt="eq")
+    __ne__ = partialmethod(_binary_op, op="Cmp", predAtt="ne")
+    __gt__ = partialmethod(_binary_op, op="Cmp", predAtt="ugt")
+    __ge__ = partialmethod(_binary_op, op="Cmp", predAtt="uge")
+    __and__ = partialmethod(_binary_op, op="And")
+    __or__ = partialmethod(_binary_op, op="Or")
+
+    def __str__(self):
+        return super().__str__().replace(ir.Value.__name__, ArithValue.__name__)
 
 
 class NVDSL:
@@ -341,71 +421,6 @@ class NVDSL:
                         sys.stdout = f
                         print(module)
                         sys.stdout = original_stdout
-
-            def _binary_op(lhs, rhs, op: str, predAtt="") -> "ArithValue":
-                """Generate MLIR's Arith dialects binary operations."""
-                rhs = const(rhs)
-                if arith._is_float_type(lhs.type) and arith._is_float_type(rhs.type):
-                    op += "F"
-                    if op.startswith("Cmp"):
-                        predicateAttr = getattr(arith, f"CmpFPredicate").__dict__[
-                            predAtt
-                        ]
-                elif arith._is_integer_like_type(
-                    lhs.type
-                ) and arith._is_integer_like_type(lhs.type):
-                    if op == "Div" or op == "Rem":
-                        op += "U"
-                    op += "I"
-                    if op.startswith("Cmp"):
-                        predicateAttr = getattr(arith, f"CmpIPredicate").__dict__[
-                            predAtt
-                        ]
-                else:
-                    raise NotImplementedError(
-                        f"Unsupported '{op}' operands: {lhs}, {rhs}"
-                    )
-
-                if op.startswith("Cmp"):
-                    op = getattr(arith, f"{op}Op")
-
-                    return op(predicateAttr, lhs, rhs).result
-                else:
-                    op = getattr(arith, f"{op}Op")
-                    return op(lhs, rhs).result
-
-            @ir.register_value_caster(ir.IndexType.static_typeid)
-            @ir.register_value_caster(ir.F32Type.static_typeid)
-            @ir.register_value_caster(ir.F16Type.static_typeid)
-            @ir.register_value_caster(ir.F64Type.static_typeid)
-            @ir.register_value_caster(ir.IntegerType.static_typeid)
-            class ArithValue(ir.Value):
-                """Overloads operators for MLIR's Arith dialects binary operations."""
-
-                def __init__(self, v):
-                    super().__init__(v)
-
-                __add__ = partialmethod(_binary_op, op="Add")
-                __sub__ = partialmethod(_binary_op, op="Sub")
-                __mul__ = partialmethod(_binary_op, op="Mul")
-                __truediv__ = partialmethod(_binary_op, op="Div")
-                __mod__ = partialmethod(_binary_op, op="Rem")
-                __xor__ = partialmethod(_binary_op, op="XOr")
-                __lt__ = partialmethod(_binary_op, op="Cmp", predAtt="ult")
-                __le__ = partialmethod(_binary_op, op="Cmp", predAtt="ule")
-                __eq__ = partialmethod(_binary_op, op="Cmp", predAtt="eq")
-                __ne__ = partialmethod(_binary_op, op="Cmp", predAtt="ne")
-                __gt__ = partialmethod(_binary_op, op="Cmp", predAtt="ugt")
-                __ge__ = partialmethod(_binary_op, op="Cmp", predAtt="uge")
-                __and__ = partialmethod(_binary_op, op="And")
-                __or__ = partialmethod(_binary_op, op="Or")
-
-                def __str__(self):
-                    return (
-                        super()
-                        .__str__()
-                        .replace(ir.Value.__name__, ArithValue.__name__)
-                    )
 
             # Generate MLIR Context and start generating IR
             with ir.Context(), ir.Location.unknown():
@@ -448,9 +463,12 @@ class NVDSL:
             # Convert input arguments to MLIR arguments
             newArgs = get_mlir_func_obj_ty(args)
 
-            # Run the compiled program
-            engine.invoke(function_name, *newArgs)
+            def _run():
+                # Run the compiled program
+                engine.invoke(function_name, *newArgs)
 
-            return result
+                return result
+
+            return _run
 
         return wrapper
